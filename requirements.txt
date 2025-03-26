@@ -1,0 +1,4 @@
+# Core requirements
+numpy==2.0.2
+pyproj==3.4.1
+boto3==1.26.0
