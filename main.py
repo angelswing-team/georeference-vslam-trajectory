@@ -1,14 +1,21 @@
-import json
+import os
 import boto3
 import numpy as np
 from pyproj import CRS, Transformer
 from io import StringIO
+import functions_framework
 
-# Initialize S3 client
-s3 = boto3.client('s3')
+# Initialize GCS client using boto3 S3-compatible API
+s3 = boto3.client(
+    "s3",
+    endpoint_url="https://storage.googleapis.com",
+    region_name="auto",
+    aws_access_key_id=os.getenv("GOOGLE_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("GOOGLE_SECRET_ACCESS_KEY"),
+)
 
 def read_trajectory_from_s3(bucket, key):
-    """Read SLAM trajectory file from S3"""
+    """Read SLAM trajectory file from Google Cloud Storage"""
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         content = response['Body'].read().decode('utf-8')
@@ -25,7 +32,7 @@ def read_trajectory_from_s3(bucket, key):
 
         return trajectories
     except Exception as e:
-        print(f"Error reading trajectory file from S3: {e}")
+        print(f"Error reading trajectory file from GCS: {e}")
         raise
 
 def calculate_transform_params(first_lat, first_lon, last_lat, last_lon, trajectories):
@@ -123,11 +130,12 @@ def convert_coordinates(x, y, z, ref_lat, ref_lon, ref_ele, rotation_angle=0, sc
         print(f"Error in coordinate conversion: {e}")
         return ref_lon, ref_lat, ref_ele
 
-def lambda_handler(event, context):
+@functions_framework.http
+def convert_trajectory(request):
     """
-    AWS Lambda handler function
+    Cloud Run HTTP endpoint handler using Functions Framework
 
-    Expected event format:
+    Expected request JSON format:
     {
         "bucket": "dev-storage.angelswing.io",
         "input_key": "videos/1398/5000/trajectory/keyframe_trajectory.txt",
@@ -139,6 +147,8 @@ def lambda_handler(event, context):
     }
     """
     try:
+        event = request.get_json()
+
         # Parse input parameters
         bucket = event.get('bucket')
         input_key = event.get('input_key')
@@ -146,20 +156,14 @@ def lambda_handler(event, context):
         manual_refs = event.get('manual_refs')
 
         if not all([bucket, input_key, output_key, manual_refs]):
-            return {
-                'statusCode': 400,
-                'body': json.dumps('Missing required parameters')
-            }
+            return ({'error': 'Missing required parameters'}, 400)
 
         # Extract reference coordinates
         first_ref = manual_refs.get('first')
         last_ref = manual_refs.get('last')
 
         if not first_ref or not last_ref or len(first_ref) != 3 or len(last_ref) != 3:
-            return {
-                'statusCode': 400,
-                'body': json.dumps('Invalid reference coordinates format')
-            }
+            return ({'error': 'Invalid reference coordinates format'}, 400)
 
         first_lat, first_lon, first_ele = first_ref
         last_lat, last_lon, last_ele = last_ref
@@ -174,10 +178,7 @@ def lambda_handler(event, context):
         trajectories = read_trajectory_from_s3(bucket, input_key)
 
         if not trajectories:
-            return {
-                'statusCode': 400,
-                'body': json.dumps('No valid trajectory data found')
-            }
+            return ({'error': 'No valid trajectory data found'}, 400)
 
         # Calculate transformation parameters
         rotation_angle, scale = calculate_transform_params(
@@ -201,23 +202,15 @@ def lambda_handler(event, context):
             except Exception as e:
                 print(f"Error processing point: {e}")
 
-        # Upload result to S3
+        # Upload result to Google Cloud Storage
         s3.put_object(
             Bucket=bucket,
             Key=output_key,
             Body=output.getvalue()
         )
 
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'message': 'Conversion completed successfully',
-            })
-        }
+        return ({'message': 'Conversion completed successfully'}, 200)
 
     except Exception as e:
-        print(f"Error in lambda function: {e}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps(f'Error: {str(e)}')
-        }
+        print(f"Error in function: {e}")
+        return ({'error': str(e)}, 500)
