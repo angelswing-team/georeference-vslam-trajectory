@@ -3,6 +3,7 @@ import boto3
 import numpy as np
 from pyproj import CRS, Transformer
 from io import StringIO
+import math
 
 # Initialize S3 client
 s3 = boto3.client('s3')
@@ -21,7 +22,11 @@ def read_trajectory_from_s3(bucket, key):
                 x = float(parts[1])  # Forward
                 y = float(parts[2])  # Left
                 z = float(parts[3])  # Up
-                trajectories.append((timestamp, x, y, z))
+                qx = float(parts[4])
+                qy = float(parts[5])
+                qz = float(parts[6])
+                qw = float(parts[7])
+                trajectories.append((timestamp, x, y, z, qx, qy, qz, qw))
 
         return trajectories
     except Exception as e:
@@ -123,6 +128,55 @@ def convert_coordinates(x, y, z, ref_lat, ref_lon, ref_ele, rotation_angle=0, sc
         print(f"Error in coordinate conversion: {e}")
         return ref_lon, ref_lat, ref_ele
 
+def quaternion_to_euler(qx, qy, qz, qw):
+    """
+    Convert quaternion to Euler angles (roll, pitch, yaw) following aerospace convention.
+    
+    Standard aerospace convention:
+    - Roll: Rotation around X axis (front-to-back)
+    - Pitch: Rotation around Y axis (side-to-side) 
+    - Yaw: Rotation around Z axis (vertical)
+    
+    Args:
+        qx, qy, qz, qw: Quaternion components
+        
+    Returns:
+        roll, pitch, yaw angles in degrees
+    """
+    # Check if quaternion is normalized
+    norm = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+    if abs(norm - 1.0) > 1e-3:
+        # Normalize the quaternion
+        qw /= norm
+        qx /= norm
+        qy /= norm
+        qz /= norm
+    
+    # Roll (x-axis rotation)
+    sinr_cosp = 2 * (qw * qx + qy * qz)
+    cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    # Pitch (y-axis rotation)
+    sinp = 2 * (qw * qy - qz * qx)
+    if abs(sinp) >= 1:
+        # Use 90 degrees if out of range
+        pitch = math.copysign(math.pi / 2, sinp)
+    else:
+        pitch = math.asin(sinp)
+
+    # Yaw (z-axis rotation)
+    siny_cosp = 2 * (qw * qz + qx * qy)
+    cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    # Convert to degrees
+    roll_deg = math.degrees(roll)
+    pitch_deg = math.degrees(pitch)
+    yaw_deg = math.degrees(yaw)
+    
+    return roll_deg, pitch_deg, yaw_deg
+
 def lambda_handler(event, context):
     """
     AWS Lambda handler function
@@ -186,16 +240,19 @@ def lambda_handler(event, context):
 
         # Convert coordinates and prepare output
         output = StringIO()
-        output.write("timestamp longitude latitude elevation\n")
+        output.write("timestamp longitude latitude elevation roll pitch yaw\n")
 
-        for timestamp, x, y, z in trajectories:
+        for timestamp, x, y, z, qx, qy, qz, qw in trajectories:
             try:
                 lon, lat, ele = convert_coordinates(
                     x, y, z, first_lat, first_lon, first_ele, rotation_angle, scale
                 )
+                
+                # Calculate roll, pitch, yaw angles from quaternion
+                roll, pitch, yaw = quaternion_to_euler(qx, qy, qz, qw)
 
                 if np.isfinite(lon) and np.isfinite(lat):
-                    output.write(f"{timestamp:.3f} {lon} {lat} {ele:.2f}\n")
+                    output.write(f"{timestamp:.3f} {lon} {lat} {ele:.2f} {roll:.2f} {pitch:.2f} {yaw:.2f}\n")
                 else:
                     print(f"Warning: Invalid coordinates generated for point: x={x}, y={y}, z={z}")
             except Exception as e:
