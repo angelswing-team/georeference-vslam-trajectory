@@ -249,6 +249,10 @@ def lambda_handler(event, context):
                 )
                 
                 # Calculate roll, pitch, yaw angles from quaternion
+                # Transform quaternion from Y-up (SLAM) to Z-up (geospatial)
+                temp_qy = qy
+                qy = -qz
+                qz = temp_qy
                 roll, pitch, yaw = quaternion_to_euler(qx, qy, qz, qw)
 
                 if np.isfinite(lon) and np.isfinite(lat):
