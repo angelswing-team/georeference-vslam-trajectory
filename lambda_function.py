@@ -254,6 +254,7 @@ def lambda_handler(event, context):
                 qy = -qz
                 qz = temp_qy
                 roll, pitch, yaw = quaternion_to_euler(qx, qy, qz, qw)
+                yaw = yaw - np.degrees(rotation_angle)
 
                 if np.isfinite(lon) and np.isfinite(lat):
                     output.write(f"{timestamp:.3f} {lon} {lat} {ele:.2f} {roll:.2f} {pitch:.2f} {yaw:.2f}\n")
