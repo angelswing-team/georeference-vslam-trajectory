@@ -25,24 +25,33 @@ def read_trajectory_from_s3(bucket, key):
         for line in content.splitlines():
             parts = line.strip().split()
             if len(parts) == 8:
-                timestamp = float(parts[0])
-                x = float(parts[1])  # Forward
-                y = float(parts[2])  # Left
-                z = float(parts[3])  # Up
-                qx = float(parts[4])
-                qy = float(parts[5])
-                qz = float(parts[6])
-                qw = float(parts[7])
-                trajectories.append((timestamp, x, y, z, qx, qy, qz, qw))
+                trajectories.append(tuple(map(float, parts)))
 
         return trajectories
     except Exception as e:
         print(f"Error reading trajectory file from GCS: {e}")
         raise
 
-def calculate_transform_params(first_lat, first_lon, last_lat, last_lon, trajectories):
-    """Calculate rotation angle and scale between SLAM and global coordinates"""
-    # Create UTM projection for distance calculation
+def calculate_affine_params(manual_refs, trajectories):
+    """
+    Calculate the 6 parameters of a 2D affine transformation using a least-squares fit
+    on multiple reference points mapped from local SLAM (x,z) to world UTM (easting,northing).
+
+    Returns (a,b,c,d,e,f), utm_crs such that:
+      UTM_E = a*X + b*Z + c
+      UTM_N = d*X + e*Z + f
+    """
+    if not isinstance(manual_refs, dict) or len(manual_refs) < 3:
+        raise ValueError("At least 3 reference points are required for an affine transformation.")
+
+    # Determine UTM from the first reference (smallest index)
+    try:
+        first_ref_idx = sorted(manual_refs.keys(), key=lambda k: int(k))[0]
+    except Exception:
+        first_ref_idx = list(manual_refs.keys())[0]
+
+    first_lat, first_lon, _ = manual_refs[first_ref_idx]
+
     utm_zone = int((first_lon + 180) / 6) + 1
     hemisphere = 'north' if first_lat >= 0 else 'south'
     wgs84_crs = CRS.from_epsg(4326)
@@ -56,109 +65,56 @@ def calculate_transform_params(first_lat, first_lon, last_lat, last_lon, traject
     })
     transformer = Transformer.from_crs(wgs84_crs, utm_crs, always_xy=True)
 
-    # Calculate GPS track length
-    first_e, first_n = transformer.transform(first_lon, first_lat)
-    last_e, last_n = transformer.transform(last_lon, last_lat)
-    gps_dx = last_e - first_e
-    gps_dy = last_n - first_n
-    gps_length = np.sqrt(gps_dx**2 + gps_dy**2)
+    local_points = []
+    world_points_utm = []
 
-    # Calculate SLAM track length
-    last_point = trajectories[-1]
-    slam_dx = last_point[1]  # x coordinate
-    slam_dy = last_point[3]  # z coordinate (forward direction)
-    slam_length = np.sqrt(slam_dx**2 + slam_dy**2)
+    for idx_key, (lat, lon, _ele) in manual_refs.items():
+        try:
+            idx = int(idx_key)
+        except Exception:
+            raise ValueError("Manual reference keys must be numeric indices as strings, e.g., '0','5','42'.")
 
-    # Calculate scale factor
-    scale = gps_length / slam_length if slam_length > 0 else 1.0
+        # trajectories[idx] = (timestamp, x, y, z, qx, qy, qz, qw)
+        _, slam_x, _, slam_z, _, _, _, _ = trajectories[idx]
+        local_points.append([slam_x, slam_z])
 
-    # Calculate rotation angle
-    gpx_vector = np.array([gps_dx, gps_dy])
-    gpx_vector = gpx_vector / np.linalg.norm(gpx_vector)
+        utm_e, utm_n = transformer.transform(lon, lat)
+        world_points_utm.append([utm_e, utm_n])
 
-    slam_vector = np.array([slam_dx, slam_dy])
-    slam_vector = slam_vector / np.linalg.norm(slam_vector)
+    local_pts_np = np.array(local_points)
+    world_pts_np = np.array(world_points_utm)
 
-    angle = np.arctan2(np.cross(slam_vector, gpx_vector), np.dot(slam_vector, gpx_vector))
+    A = np.hstack([local_pts_np, np.ones((local_pts_np.shape[0], 1))])
 
-    print(f"GPS track length: {gps_length:.2f}m")
-    print(f"SLAM track length: {slam_length:.2f}m")
-    print(f"Scale factor: {scale:.4f}")
-    print(f"Rotation angle: {np.degrees(angle):.2f} degrees")
+    params_x, _, _, _ = np.linalg.lstsq(A, world_pts_np[:, 0], rcond=None)
+    params_y, _, _, _ = np.linalg.lstsq(A, world_pts_np[:, 1], rcond=None)
 
-    return angle, scale
+    a, b, c = params_x
+    d, e, f = params_y
 
-def convert_coordinates(x, y, z, ref_lat, ref_lon, ref_ele, rotation_angle=0, scale=1.0):
-    """Convert local coordinates from Stella-SLAM to global coordinates with rotation and scale"""
-    # Define CRS explicitly
-    utm_zone = int((ref_lon + 180) / 6) + 1
-    hemisphere = 'north' if ref_lat >= 0 else 'south'
+    print("Calculated Affine Transformation Parameters:")
+    print(f"a={a:.4f}, b={b:.4f}, c={c:.4f}")
+    print(f"d={d:.4f}, e={e:.4f}, f={f:.4f}")
 
-    # Create CRS objects
+    return (float(a), float(b), float(c), float(d), float(e), float(f)), utm_crs
+
+def apply_affine_transform(x, y, z, affine_params, ref_ele, utm_crs):
+    """Convert local SLAM coordinates to global coordinates using affine parameters."""
+    a, b, c, d, e, f = affine_params
+
     wgs84_crs = CRS.from_epsg(4326)
-    utm_crs = CRS.from_dict({
-        'proj': 'utm',
-        'zone': utm_zone,
-        'hemisphere': hemisphere,
-        'ellps': 'WGS84',
-        'datum': 'WGS84',
-        'units': 'm'
-    })
-
-    # Create transformer
-    transformer = Transformer.from_crs(wgs84_crs, utm_crs, always_xy=True)
     inverse_transformer = Transformer.from_crs(utm_crs, wgs84_crs, always_xy=True)
 
-    try:
-        # Convert reference point to UTM
-        ref_e, ref_n = transformer.transform(ref_lon, ref_lat)
+    utm_e = a * x + b * z + c
+    utm_n = d * x + e * z + f
 
-        # Apply scale and rotation to x,z coordinates
-        x_scaled = x * scale
-        z_scaled = z * scale
+    elevation = ref_ele - y
 
-        cos_angle = np.cos(rotation_angle)
-        sin_angle = np.sin(rotation_angle)
-        x_rotated = x_scaled * cos_angle - z_scaled * sin_angle
-        z_rotated = x_scaled * sin_angle + z_scaled * cos_angle
-
-        # Convert coordinates
-        utm_e = ref_e + x_rotated
-        utm_n = ref_n + z_rotated
-        elevation = ref_ele - y
-
-        # Convert back to WGS84
-        lon, lat = inverse_transformer.transform(utm_e, utm_n)
-        return lon, lat, elevation
-
-    except Exception as e:
-        print(f"Error in coordinate conversion: {e}")
-        return ref_lon, ref_lat, ref_ele
+    lon, lat = inverse_transformer.transform(utm_e, utm_n)
+    return lon, lat, elevation
 
 def quaternion_to_euler(qx, qy, qz, qw):
-    """
-    Convert quaternion to Euler angles (roll, pitch, yaw) following aerospace convention.
-
-    Standard aerospace convention:
-    - Roll: Rotation around X axis (front-to-back)
-    - Pitch: Rotation around Y axis (side-to-side)
-    - Yaw: Rotation around Z axis (vertical)
-
-    Args:
-        qx, qy, qz, qw: Quaternion components
-
-    Returns:
-        roll, pitch, yaw angles in degrees
-    """
-    # Check if quaternion is normalized
-    norm = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
-    if abs(norm - 1.0) > 1e-3:
-        # Normalize the quaternion
-        qw /= norm
-        qx /= norm
-        qy /= norm
-        qz /= norm
-
+    """Convert quaternion to Euler angles (roll, pitch, yaw) in degrees."""
     # Roll (x-axis rotation)
     sinr_cosp = 2 * (qw * qx + qy * qz)
     cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
@@ -167,7 +123,6 @@ def quaternion_to_euler(qx, qy, qz, qw):
     # Pitch (y-axis rotation)
     sinp = 2 * (qw * qy - qz * qx)
     if abs(sinp) >= 1:
-        # Use 90 degrees if out of range
         pitch = math.copysign(math.pi / 2, sinp)
     else:
         pitch = math.asin(sinp)
@@ -177,12 +132,7 @@ def quaternion_to_euler(qx, qy, qz, qw):
     cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
     yaw = math.atan2(siny_cosp, cosy_cosp)
 
-    # Convert to degrees
-    roll_deg = math.degrees(roll)
-    pitch_deg = math.degrees(pitch)
-    yaw_deg = math.degrees(yaw)
-
-    return roll_deg, pitch_deg, yaw_deg
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 @functions_framework.http
 def convert_trajectory(request):
@@ -195,8 +145,9 @@ def convert_trajectory(request):
         "input_key": "videos/1398/5000/trajectory/keyframe_trajectory.txt",
         "output_key": "videos/1398/5000/trajectory/geo_trajectory.txt",
         "manual_refs": {
-            "first": [37.237346666666674,127.2938166666666,170.9],
-            "last": [37.2366433396141,127.29341833301352,157.301]
+            "0": [lat, lon, ele],
+            "12": [lat, lon, ele],
+            "42": [lat, lon, ele]
         }
     }
     """
@@ -212,21 +163,13 @@ def convert_trajectory(request):
         if not all([bucket, input_key, output_key, manual_refs]):
             return ({'error': 'Missing required parameters'}, 400)
 
-        # Extract reference coordinates
-        first_ref = manual_refs.get('first')
-        last_ref = manual_refs.get('last')
-
-        if not first_ref or not last_ref or len(first_ref) != 3 or len(last_ref) != 3:
-            return ({'error': 'Invalid reference coordinates format'}, 400)
-
-        first_lat, first_lon, first_ele = first_ref
-        last_lat, last_lon, last_ele = last_ref
+        # Validate reference points (require at least 3 for affine transformation)
+        if not isinstance(manual_refs, dict) or len(manual_refs) < 3:
+            return ({'error': 'At least 3 reference points are required in manual_refs'}, 400)
 
         # Log configuration
         print(f"Processing file {input_key} to {output_key}")
-        print(f"First reference: lat={first_lat}, lon={first_lon}, ele={first_ele}")
-        print(f"Last reference: lat={last_lat}, lon={last_lon}, ele={last_ele}")
-        print(f"UTM Zone: {int((first_lon + 180) / 6) + 1}")
+        print(f"Manual reference points provided: {len(manual_refs)}")
 
         # Read trajectory data
         trajectories = read_trajectory_from_s3(bucket, input_key)
@@ -234,26 +177,42 @@ def convert_trajectory(request):
         if not trajectories:
             return ({'error': 'No valid trajectory data found'}, 400)
 
-        # Calculate transformation parameters
-        rotation_angle, scale = calculate_transform_params(
-            first_lat, first_lon, last_lat, last_lon, trajectories
-        )
+        # Calculate affine transformation parameters from all reference points
+        affine_params, utm_crs = calculate_affine_params(manual_refs, trajectories)
+
+        # Derive effective rotation from affine (used for yaw correction)
+        a, _b, _c, d, _e, _f = affine_params
+        effective_rotation_angle = np.arctan2(d, a)
 
         # Convert coordinates and prepare output
         output = StringIO()
         output.write("timestamp longitude latitude elevation roll pitch yaw\n")
 
+        # Use the first reference's elevation as baseline
+        try:
+            first_ref_idx = sorted(manual_refs.keys(), key=lambda k: int(k))[0]
+        except Exception:
+            first_ref_idx = list(manual_refs.keys())[0]
+        _lat0, _lon0, first_ele = manual_refs[first_ref_idx]
+
         for timestamp, x, y, z, qx, qy, qz, qw in trajectories:
             try:
-                lon, lat, ele = convert_coordinates(
-                    x, y, z, first_lat, first_lon, first_ele, rotation_angle, scale
+                # Affine transform of (x,z) to lon/lat, with elevation from y
+                lon, lat, ele = apply_affine_transform(
+                    x, y, z, affine_params, first_ele, utm_crs
                 )
 
-                # Calculate roll, pitch, yaw angles from quaternion
-                roll, pitch, yaw = quaternion_to_euler(qx, qy, qz, qw)
+                # Transform quaternion from Y-up (SLAM) to Z-up (geospatial)
+                temp_qy = qy
+                qy_new = -qz
+                qz_new = temp_qy
+
+                # Convert quaternion to Euler and correct yaw by effective rotation
+                roll, pitch, yaw = quaternion_to_euler(qx, qy_new, qz_new, qw)
+                yaw = yaw - np.degrees(effective_rotation_angle)
 
                 if np.isfinite(lon) and np.isfinite(lat):
-                    output.write(f"{timestamp:.3f} {lon} {lat} {ele:.2f} {roll:.2f} {pitch:.2f} {yaw:.2f}\n")
+                    output.write(f"{timestamp:.3f} {lon:.8f} {lat:.8f} {ele:.3f} {roll:.3f} {pitch:.3f} {yaw:.3f}\n")
                 else:
                     print(f"Warning: Invalid coordinates generated for point: x={x}, y={y}, z={z}")
             except Exception as e:
@@ -266,7 +225,7 @@ def convert_trajectory(request):
             Body=output.getvalue()
         )
 
-        return ({'message': 'Conversion completed successfully'}, 200)
+        return ({'message': 'Conversion completed successfully using affine transformation'}, 200)
 
     except Exception as e:
         print(f"Error in function: {e}")
