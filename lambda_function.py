@@ -3,23 +3,34 @@ import boto3
 import numpy as np
 from pyproj import CRS, Transformer
 from io import StringIO
-import math
 
 # Initialize S3 client
 s3 = boto3.client('s3')
 
 def read_trajectory_from_s3(bucket, key):
-    """Read SLAM trajectory file from S3"""
+    """Read trajectory file with Euler angles from S3"""
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         content = response['Body'].read().decode('utf-8')
 
         trajectories = []
         for line in content.splitlines():
-            parts = line.strip().split()
-            if len(parts) == 8:
-                # timestamp tx ty tz qx qy qz qw
-                trajectories.append(tuple(map(float, parts)))
+            line = line.strip()
+            if line.startswith('#') or not line:
+                continue  # Skip comments and empty lines
+
+            parts = line.split('\t')  # Tab-separated values
+            if len(parts) >= 10:  # PhotoID, X, Y, Z, Omega, Phi, Kappa, and rotation matrix
+                try:
+                    photo_id = parts[0]
+                    x, y, z = map(float, parts[1:4])
+                    omega, phi, kappa = map(float, parts[4:7])
+                    # Return: photo_id, x, y, z, omega, phi, kappa
+                    trajectories.append((photo_id, x, y, z, omega, phi, kappa))
+
+                except (ValueError, IndexError) as e:
+                    print(f"Warning: Skipping invalid line: {line} - {e}")
+                    continue
 
         return trajectories
     except Exception as e:
@@ -60,7 +71,9 @@ def calculate_affine_params(manual_refs, trajectories):
     for idx_str, (lat, lon, ele) in manual_refs.items():
         idx = int(idx_str)
         # SLAM local coordinates (x, z are used for 2D plane)
-        _, slam_x, _, slam_z, _, _, _, _ = trajectories[idx]
+        # Note: trajectories list is 0-indexed, but reference indices are 1-indexed frame numbers
+        trajectory_idx = idx - 1 if idx > 0 else 0
+        _, slam_x, _, slam_z, _, _, _ = trajectories[trajectory_idx]
         local_points.append([slam_x, slam_z])
 
         # World coordinates converted to UTM
@@ -113,27 +126,6 @@ def apply_affine_transform(x, y, z, affine_params, ref_ele, utm_crs):
 
     return lon, lat, elevation
 
-def quaternion_to_euler(qx, qy, qz, qw):
-    """Convert quaternion to Euler angles (roll, pitch, yaw) in degrees."""
-    # Roll (x-axis rotation)
-    sinr_cosp = 2 * (qw * qx + qy * qz)
-    cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-
-    # Pitch (y-axis rotation)
-    sinp = 2 * (qw * qy - qz * qx)
-    if abs(sinp) >= 1:
-        pitch = math.copysign(math.pi / 2, sinp)
-    else:
-        pitch = math.asin(sinp)
-
-    # Yaw (z-axis rotation)
-    siny_cosp = 2 * (qw * qz + qx * qy)
-    cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-
-    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
-
 def lambda_handler(event, context):
     """
     AWS Lambda handler function for georeferencing SLAM trajectories
@@ -184,25 +176,20 @@ def lambda_handler(event, context):
 
         # Convert coordinates and prepare output file
         output = StringIO()
-        output.write("timestamp longitude latitude elevation roll pitch yaw\n")
+        output.write("photo_id longitude latitude elevation roll pitch yaw\n")
 
-        for timestamp, x, y, z, qx, qy, qz, qw in trajectories:
+        for photo_id, x, y, z, omega, phi, kappa in trajectories:
             try:
                 lon, lat, ele = apply_affine_transform(
                     x, y, z, affine_params, first_ele, utm_crs
                 )
-
-                temp_qy = qy
-                qy_new = -qz
-                qz_new = temp_qy
-
-                # STEP 2: Convert the corrected quaternion to Euler angles.
-                roll, pitch, yaw = quaternion_to_euler(qx, qy_new, qz_new, qw)
+                # roll, pitch, yaw = omega, phi, kappa
+                roll, pitch, yaw = -omega, -kappa, -phi
 
                 yaw = yaw - np.degrees(effective_rotation_angle)
 
                 if np.isfinite(lon) and np.isfinite(lat):
-                    output.write(f"{timestamp:.3f} {lon:.8f} {lat:.8f} {ele:.3f} {roll:.3f} {pitch:.3f} {yaw:.3f}\n")
+                    output.write(f"{photo_id:.3f} {lon:.8f} {lat:.8f} {ele:.3f} {roll:.3f} {pitch:.3f} {yaw:.3f}\n")
                 else:
                     print(f"Warning: Invalid coordinates generated for point: x={x}, y={y}, z={z}")
             except Exception as e:
