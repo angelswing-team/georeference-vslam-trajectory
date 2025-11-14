@@ -3,223 +3,290 @@ import boto3
 import numpy as np
 from pyproj import CRS, Transformer
 from io import StringIO
-import math
 
-# Initialize S3 client
+
+# Initialize S3 client once per container reuse.
 s3 = boto3.client('s3')
 
-def read_trajectory_from_s3(bucket, key):
-    """Read SLAM trajectory file from S3"""
+
+# --------------------------------------------------------------------------- #
+# Data loading utilities
+# --------------------------------------------------------------------------- #
+def read_trajectory_from_s3(bucket: str, key: str):
+    """
+    Read a Metashape trajectory file that contains position, orientation, and
+    optionally the camera-to-world rotation matrix (r11–r33).
+    """
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         content = response['Body'].read().decode('utf-8')
-
-        trajectories = []
-        for line in content.splitlines():
-            parts = line.strip().split()
-            if len(parts) == 8:
-                # timestamp tx ty tz qx qy qz qw
-                trajectories.append(tuple(map(float, parts)))
-
-        return trajectories
-    except Exception as e:
-        print(f"Error reading trajectory file from S3: {e}")
+    except Exception as exc:
+        print(f"Error reading trajectory file from S3: {exc}")
         raise
 
-def calculate_affine_params(manual_refs, trajectories):
+    trajectories = []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith('#') or not stripped:
+            continue  # skip comments and blanks
+
+        parts = stripped.split('\t')
+        if len(parts) < 10:
+            continue  # not enough data for pose
+
+        try:
+            photo_id = parts[0]
+            x, y, z = map(float, parts[1:4])
+            omega, phi, kappa = map(float, parts[4:7])
+
+            if len(parts) >= 16:
+                rotation_matrix = np.array(list(map(float, parts[7:16])), dtype=float).reshape(3, 3)
+            else:
+                rotation_matrix = euler_angles_to_matrix(omega, phi, kappa)
+
+            trajectories.append(
+                {
+                    'photo_id': photo_id,
+                    'x': x,
+                    'y': y,
+                    'z': z,
+                    'omega': omega,
+                    'phi': phi,
+                    'kappa': kappa,
+                    'rotation_matrix': rotation_matrix,
+                }
+            )
+        except (ValueError, IndexError) as exc:
+            print(f"Warning: skipping invalid line '{stripped}': {exc}")
+            continue
+
+    return trajectories
+
+
+def euler_angles_to_matrix(omega: float, phi: float, kappa: float) -> np.ndarray:
+    """Return the Metashape camera rotation matrix derived from OPK angles."""
+    omega_rad = np.radians(omega)
+    phi_rad = np.radians(phi)
+    kappa_rad = np.radians(kappa)
+
+    sin_o, cos_o = np.sin(omega_rad), np.cos(omega_rad)
+    sin_p, cos_p = np.sin(phi_rad), np.cos(phi_rad)
+    sin_k, cos_k = np.sin(kappa_rad), np.cos(kappa_rad)
+
+    return np.array(
+        [
+            [cos_p * cos_k, cos_o * sin_k + sin_o * sin_p * cos_k, sin_o * sin_k - cos_o * sin_p * cos_k],
+            [-cos_p * sin_k, cos_o * cos_k - sin_o * sin_p * sin_k, sin_o * cos_k + cos_o * sin_p * sin_k],
+            [sin_p, -sin_o * cos_p, cos_o * cos_p],
+        ],
+        dtype=float,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Geometry helpers
+# --------------------------------------------------------------------------- #
+def build_local_to_world_axes(affine_params):
     """
-    Calculate the 6 parameters of an affine transformation using a least-squares fit
-    on multiple reference points.
+    Construct an orthonormal basis that maps Metashape local axes to world ENU.
+
+    The affine fit already captures scaling and rotation in the horizontal
+    plane; this builds an orthonormal basis we can apply to the rotation matrix
+    so position and orientation use the same transform.
     """
-    # Validate that we have enough points to solve
+    a, b, _, d, e, _ = affine_params
+
+    local_x = np.array([a, d, 0.0], dtype=float)
+    local_z = np.array([b, e, 0.0], dtype=float)
+
+    x_norm = np.linalg.norm(local_x)
+    if x_norm < 1e-8:
+        raise ValueError("Affine transform produced a degenerate X axis.")
+    x_unit = local_x / x_norm
+
+    z_proj = local_z - np.dot(local_z, x_unit) * x_unit
+    z_norm = np.linalg.norm(z_proj)
+    if z_norm < 1e-8:
+        z_proj = np.array([-x_unit[1], x_unit[0], 0.0], dtype=float)
+        z_norm = np.linalg.norm(z_proj)
+        if z_norm < 1e-8:
+            raise ValueError("Affine transform cannot derive a stable Z axis.")
+    z_unit = z_proj / z_norm
+
+    y_unit = np.cross(x_unit, z_unit)
+    y_norm = np.linalg.norm(y_unit)
+    if y_norm < 1e-8:
+        raise ValueError("Failed to compute vertical axis from affine transform.")
+    y_unit = y_unit / y_norm
+
+    if y_unit[2] < 0:
+        y_unit = -y_unit
+        z_unit = -z_unit
+
+    return np.column_stack((x_unit, -y_unit, z_unit))
+
+
+def wrap_to_180(angle_degrees: float) -> float:
+    """Normalize an angle to [-180, 180)."""
+    return (angle_degrees + 180.0) % 360.0 - 180.0
+
+
+def clamp_index(trajectories, idx: int) -> int:
+    """Clamp the manual reference index to the available trajectory range."""
+    if not trajectories:
+        raise ValueError("No trajectory data available.")
+    return max(0, min(len(trajectories) - 1, idx))
+
+
+def calculate_affine_params(manual_refs: dict, trajectories: list):
+    """Solve the 2D affine transform that aligns Metashape X/Z to world EN coordinates."""
     if len(manual_refs) < 3:
         raise ValueError("At least 3 reference points are required for an affine transformation.")
 
-    # Get the first reference lon to determine the UTM zone for consistency
-    first_ref_idx = sorted(manual_refs.keys(), key=int)[0]
+    first_ref_idx = min(manual_refs.keys(), key=lambda key: int(key))
     first_lat, first_lon, _ = manual_refs[first_ref_idx]
 
-    # Create UTM projection for all points
     utm_zone = int((first_lon + 180) / 6) + 1
     hemisphere = 'north' if first_lat >= 0 else 'south'
     wgs84_crs = CRS.from_epsg(4326)
-    utm_crs = CRS.from_dict({
-        'proj': 'utm',
-        'zone': utm_zone,
-        'hemisphere': hemisphere,
-        'ellps': 'WGS84',
-        'datum': 'WGS84',
-        'units': 'm'
-    })
+    utm_crs = CRS.from_dict(
+        {
+            'proj': 'utm',
+            'zone': utm_zone,
+            'hemisphere': hemisphere,
+            'ellps': 'WGS84',
+            'datum': 'WGS84',
+            'units': 'm',
+        }
+    )
     transformer = Transformer.from_crs(wgs84_crs, utm_crs, always_xy=True)
 
     local_points = []
-    world_points_utm = []
+    world_points = []
 
-    # Prepare control points
-    for idx_str, (lat, lon, ele) in manual_refs.items():
-        idx = int(idx_str)
-        # SLAM local coordinates (x, z are used for 2D plane)
-        _, slam_x, _, slam_z, _, _, _, _ = trajectories[idx]
-        local_points.append([slam_x, slam_z])
+    for idx_str, (lat, lon, _) in manual_refs.items():
+        idx = clamp_index(trajectories, int(idx_str))
+        trajectory = trajectories[idx]
 
-        # World coordinates converted to UTM
+        local_points.append([trajectory['x'], trajectory['z']])
         utm_e, utm_n = transformer.transform(lon, lat)
-        world_points_utm.append([utm_e, utm_n])
+        world_points.append([utm_e, utm_n])
 
-    local_pts_np = np.array(local_points)
-    world_pts_utm_np = np.array(world_points_utm)
+    local_pts_np = np.asarray(local_points, dtype=float)
+    world_pts_np = np.asarray(world_points, dtype=float)
+    design_matrix = np.hstack([local_pts_np, np.ones((local_pts_np.shape[0], 1))])
 
-    # Pad local points with a column of ones for the affine transformation matrix
-    A = np.hstack([local_pts_np, np.ones((local_pts_np.shape[0], 1))])
+    params_x, _, _, _ = np.linalg.lstsq(design_matrix, world_pts_np[:, 0], rcond=None)
+    params_y, _, _, _ = np.linalg.lstsq(design_matrix, world_pts_np[:, 1], rcond=None)
 
-    # Solve for the transformation parameters (a, d, c) and (b, e, f) using least squares
-    # This finds the best fit if more than 3 points are provided.
-    # World_X = a*Local_X + b*Local_Y + c
-    # World_Y = d*Local_X + e*Local_Y + f
-    # Note: Our local_y is slam_z
-    params_x, _, _, _ = np.linalg.lstsq(A, world_pts_utm_np[:, 0], rcond=None)
-    params_y, _, _, _ = np.linalg.lstsq(A, world_pts_utm_np[:, 1], rcond=None)
+    return (*params_x, *params_y), utm_crs
 
-    # Parameters: a, b, c, d, e, f
-    a, b, c = params_x
-    d, e, f = params_y
 
-    print(f"Calculated Affine Transformation Parameters:")
-    print(f"a={a:.4f}, b={b:.4f}, c={c:.4f}")
-    print(f"d={d:.4f}, e={e:.4f}, f={f:.4f}")
+def apply_affine_transform(x: float, y: float, z: float, affine_params, ref_ele: float, utm_crs):
+    """
+    Transform Metashape local coordinates to WGS84.
 
-    return (a, b, c, d, e, f), utm_crs
-
-def apply_affine_transform(x, y, z, affine_params, ref_ele, utm_crs):
-    """Convert local SLAM coordinates to global coordinates using affine parameters."""
-    # Unpack parameters
+    The affine fit is applied in the X/Z plane; elevation is derived by anchoring
+    to the first reference's world elevation.
+    """
     a, b, c, d, e, f = affine_params
-
-    # Create the inverse transformer to convert from UTM back to WGS84
-    wgs84_crs = CRS.from_epsg(4326)
-    inverse_transformer = Transformer.from_crs(utm_crs, wgs84_crs, always_xy=True)
-
-    # Apply the 2D affine transformation to the x, z plane
-    # Note: SLAM's forward direction 'z' corresponds to the second dimension in our 2D plane
     utm_e = a * x + b * z + c
     utm_n = d * x + e * z + f
 
-    # Handle elevation simply based on reference and SLAM's y-axis
-    elevation = ref_ele - y
-
-    # Convert the transformed UTM coordinates back to WGS84 (lon, lat)
+    wgs84_crs = CRS.from_epsg(4326)
+    inverse_transformer = Transformer.from_crs(utm_crs, wgs84_crs, always_xy=True)
     lon, lat = inverse_transformer.transform(utm_e, utm_n)
-
+    elevation = ref_ele - y
     return lon, lat, elevation
 
-def quaternion_to_euler(qx, qy, qz, qw):
-    """Convert quaternion to Euler angles (roll, pitch, yaw) in degrees."""
-    # Roll (x-axis rotation)
-    sinr_cosp = 2 * (qw * qx + qy * qz)
-    cosr_cosp = 1 - 2 * (qx * qx + qy * qy)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
 
-    # Pitch (y-axis rotation)
-    sinp = 2 * (qw * qy - qz * qx)
-    if abs(sinp) >= 1:
-        pitch = math.copysign(math.pi / 2, sinp)
-    else:
-        pitch = math.asin(sinp)
-
-    # Yaw (z-axis rotation)
-    siny_cosp = 2 * (qw * qz + qx * qy)
-    cosy_cosp = 1 - 2 * (qy * qy + qz * qz)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-
-    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
-
-def lambda_handler(event, context):
+# --------------------------------------------------------------------------- #
+# Lambda entry point
+# --------------------------------------------------------------------------- #
+def lambda_handler(event, _context):
     """
-    AWS Lambda handler function for georeferencing SLAM trajectories
-    using a multi-point affine transformation.
+    Entry point: read references and trajectory, fit affine, emit geo-posed file.
 
-        Expected event format:
-    {
-        "bucket": "dev-storage.angelswing.io",
-        "input_key": "videos/1398/5000/trajectory/keyframe_trajectory.txt",
-        "output_key": "videos/1398/5000/trajectory/geo_trajectory.txt",
-        "manual_refs": {
-            "0": [37.237346666666674,127.2938166666666,170.9],
-            "index": [37.2366433396141,127.29341833301352,157.301],
-            "last_index": [37.2366433396141,127.29341833301352,157.301]
+    Expected event payload:
+        {
+            "bucket": "...",
+            "input_key": "...",
+            "output_key": "...",
+            "manual_refs": {
+                "0": [lat, lon, elev],
+                "15": [...],
+                ...
+            }
         }
-    }
     """
     try:
         bucket = event.get('bucket')
         input_key = event.get('input_key')
         output_key = event.get('output_key')
-        manual_refs = event.get('manual_refs')
+        manual_refs = event.get('manual_refs') or {}
 
         if not all([bucket, input_key, output_key, manual_refs]):
             return {'statusCode': 400, 'body': json.dumps('Missing required parameters')}
 
-        # Log configuration
-        print(f"Processing file {input_key} to {output_key}")
-        print(f"Manual reference points provided: {len(manual_refs)}")
-
-        # Read trajectory data from S3
         trajectories = read_trajectory_from_s3(bucket, input_key)
         if not trajectories:
             return {'statusCode': 400, 'body': json.dumps('No valid trajectory data found')}
 
-        # Calculate transformation parameters using all reference points
         affine_params, utm_crs = calculate_affine_params(manual_refs, trajectories)
+        axes_matrix = build_local_to_world_axes(affine_params)
 
-        # Calculate the effective rotation of the transformation for yaw correction.
-        # This angle represents how the new X-axis is oriented.
-        a, _, _, d, _, _ = affine_params
-        effective_rotation_angle = np.arctan2(d, a)
-        print(f"Effective rotation angle for yaw correction: {np.degrees(effective_rotation_angle):.2f} degrees")
-
-        # Get the first reference point for initial elevation
-        first_ref_idx = sorted(manual_refs.keys(), key=int)[0]
+        first_ref_idx = min(manual_refs.keys(), key=lambda key: int(key))
         _, _, first_ele = manual_refs[first_ref_idx]
 
-        # Convert coordinates and prepare output file
         output = StringIO()
-        output.write("timestamp longitude latitude elevation roll pitch yaw\n")
+        output.write("photo_id longitude latitude elevation roll pitch yaw\n")
 
-        for timestamp, x, y, z, qx, qy, qz, qw in trajectories:
+        for trajectory in trajectories:
             try:
                 lon, lat, ele = apply_affine_transform(
-                    x, y, z, affine_params, first_ele, utm_crs
+                    trajectory['x'],
+                    trajectory['y'],
+                    trajectory['z'],
+                    affine_params,
+                    first_ele,
+                    utm_crs,
                 )
 
-                temp_qy = qy
-                qy_new = -qz
-                qz_new = temp_qy
+                camera_axes_world = axes_matrix @ trajectory['rotation_matrix']
+                for axis in range(3):
+                    axis_world = camera_axes_world[:, axis]
+                    axis_norm = np.linalg.norm(axis_world)
+                    if axis_norm > 1e-8:
+                        camera_axes_world[:, axis] = axis_world / axis_norm
 
-                # STEP 2: Convert the corrected quaternion to Euler angles.
-                roll, pitch, yaw = quaternion_to_euler(qx, qy_new, qz_new, qw)
+                forward_world = camera_axes_world[:, 2]
+                east = forward_world[0]
+                north = forward_world[1]
+                horizontal_norm = np.hypot(east, north)
+                if horizontal_norm < 1e-8:
+                    yaw = 0.0
+                else:
+                    yaw = wrap_to_180(np.degrees(np.arctan2(east, north)))
 
-                yaw = yaw - np.degrees(effective_rotation_angle)
+                roll = wrap_to_180(-trajectory['omega'])
+                pitch = wrap_to_180(-trajectory['kappa'])
 
                 if np.isfinite(lon) and np.isfinite(lat):
-                    output.write(f"{timestamp:.3f} {lon:.8f} {lat:.8f} {ele:.3f} {roll:.3f} {pitch:.3f} {yaw:.3f}\n")
+                    output.write(
+                        f"{trajectory['photo_id']} {lon:.8f} {lat:.8f} {ele:.3f} "
+                        f"{roll:.3f} {pitch:.3f} {yaw:.3f}\n"
+                    )
                 else:
-                    print(f"Warning: Invalid coordinates generated for point: x={x}, y={y}, z={z}")
-            except Exception as e:
-                print(f"Error processing point ({x},{y},{z}): {e}")
+                    print(f"Warning: invalid coordinates for {trajectory['photo_id']}")
+            except Exception as exc:
+                print(f"Error processing trajectory {trajectory['photo_id']}: {exc}")
 
-        # Upload the georeferenced trajectory to S3
-        s3.put_object(
-            Bucket=bucket,
-            Key=output_key,
-            Body=output.getvalue()
-        )
-
+        s3.put_object(Bucket=bucket, Key=output_key, Body=output.getvalue())
         return {
             'statusCode': 200,
-            'body': json.dumps({'message': 'Conversion completed successfully using affine transformation'})
+            'body': json.dumps({'message': 'Conversion completed successfully using affine transformation'}),
         }
 
-    except Exception as e:
-        print(f"Error in lambda function: {e}")
-        return {'statusCode': 500, 'body': json.dumps(f'Error: {str(e)}')}
+    except Exception as exc:
+        print(f"Error in lambda function: {exc}")
+        return {'statusCode': 500, 'body': json.dumps(f'Error: {str(exc)}')}
